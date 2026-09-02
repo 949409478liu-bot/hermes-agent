@@ -3099,6 +3099,41 @@ class SessionStore:
             self._save()
             return True
 
+    def get_pending_telegram_handoff(
+        self, session_key: str, expected_session_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return a copy of the pending Telegram /new handoff, if any."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or (
+                expected_session_id is not None
+                and entry.session_id != expected_session_id
+            ):
+                return None
+            value = entry.metadata.get("telegram_new_handoff")
+            if not isinstance(value, dict) or not value.get("pending"):
+                return None
+            return dict(value)
+
+    def consume_pending_telegram_handoff(
+        self, session_key: str, expected_session_id: str
+    ) -> bool:
+        """CAS-consume a handoff after a successful first ordinary turn."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return False
+            value = entry.metadata.get("telegram_new_handoff")
+            if not isinstance(value, dict) or not value.get("pending"):
+                return False
+            consumed = dict(value)
+            consumed["pending"] = False
+            entry.metadata["telegram_new_handoff"] = consumed
+            self._save()
+            return True
+
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]
     ) -> None:
@@ -3416,8 +3451,15 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
-        """Force reset a session, creating a new session ID."""
+    def reset_session(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        *,
+        expected_session_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SessionEntry]:
+        """Force reset a session, optionally guarded by the expected old ID."""
         db_end_session_id = None
         db_create_kwargs = None
         new_entry = None
@@ -3429,6 +3471,8 @@ class SessionStore:
                 return None
 
             old_entry = self._entries[session_key]
+            if expected_session_id is not None and old_entry.session_id != expected_session_id:
+                return None
             db_end_session_id = old_entry.session_id
 
             now = _now()
@@ -3443,6 +3487,7 @@ class SessionStore:
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                metadata=dict(metadata or {}),
                 is_fresh_reset=True,
             )
 
@@ -4118,6 +4163,22 @@ class SessionStore:
                 session_id, e,
             )
             return []
+
+    def load_transcript_for_handoff(self, session_id: str) -> List[Dict[str, Any]]:
+        """Strict transcript read for /new: read failures must abort the reset."""
+        if not self._db:
+            raise RuntimeError("session database is unavailable")
+        reroutes = getattr(self, "_transcript_reroutes", None) or {}
+        seen = set()
+        while session_id in reroutes and session_id not in seen:
+            seen.add(session_id)
+            session_id = reroutes[session_id]
+        tip = self._db.get_compression_tip(session_id)
+        if tip:
+            session_id = tip
+        return self._db.get_messages_as_conversation(
+            session_id, repair_alternation=False
+        )
 
     def rewind_session(
         self,

@@ -36,6 +36,7 @@ from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_c
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
+    SessionEntry,
     SessionSource,
     build_session_key,
     is_shared_multi_user_session,
@@ -145,8 +146,65 @@ class GatewaySlashCommandsMixin:
         """Handle /new or /reset command."""
         source = event.source
         
-        # Get existing session key
+        # Get existing session key. Telegram /new snapshots and summarizes the
+        # old transcript before any reset side effects. Other platforms and
+        # /reset deliberately keep the native v0.21.0 path unchanged.
         session_key = self._session_key_for_source(source)
+        old_entry = self.session_store._entries.get(session_key)
+        # Real stores always hold SessionEntry objects. Keep lightweight test
+        # doubles on the byte-compatible native path when they do not model
+        # the routing entry, while retaining CAS for production entries.
+        old_entry_is_real = isinstance(old_entry, SessionEntry)
+        old_session_id = old_entry.session_id if old_entry_is_real else None
+        handoff_metadata = None
+        is_telegram_new = (
+            source.platform == Platform.TELEGRAM and event.get_command() == "new"
+        )
+        if is_telegram_new and old_entry is not None and old_session_id:
+            try:
+                history = await self.async_session_store.load_transcript_for_handoff(
+                    old_session_id
+                )
+                # Some lightweight test doubles do not model transcript reads;
+                # treat those as an empty session, while real read failures are
+                # surfaced without rotating the old session.
+                if isinstance(history, list) and history:
+                    from gateway.handoff import generate_handoff
+
+                    try:
+                        _model, _runtime = self._resolve_session_agent_runtime(
+                            source=source, session_key=session_key
+                        )
+                        _main_runtime = {
+                            "model": _model,
+                            "provider": _runtime.get("provider"),
+                            "base_url": _runtime.get("base_url"),
+                            "api_key": _runtime.get("api_key"),
+                            "api_mode": _runtime.get("api_mode"),
+                        }
+                    except Exception:
+                        _main_runtime = None
+                    try:
+                        handoff_text = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                generate_handoff,
+                                history,
+                                main_runtime=_main_runtime,
+                            ),
+                            timeout=45.0,
+                        )
+                    except Exception as exc:
+                        logger.warning("Telegram /new handoff failed; preserving old session: %s", exc)
+                        return EphemeralReply("⚠️ 无法生成会话交接，旧 Session 已保留；请稍后重试 /new。")
+                    handoff_metadata = {
+                        "pending": True,
+                        "text": handoff_text,
+                        "source_session_id": old_session_id,
+                    }
+            except Exception as exc:
+                logger.warning("Telegram /new transcript read failed; preserving old session: %s", exc)
+                return EphemeralReply("⚠️ 无法读取旧会话，旧 Session 已保留；请稍后重试 /new。")
+
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
@@ -155,9 +213,7 @@ class GatewaySlashCommandsMixin:
         # Idempotent, so the run's finally calling it again is harmless.
         self._release_running_agent_state(session_key)
 
-        # Snapshot the old entry so on_session_finalize can report the
-        # expiring session id before reset_session() rotates it.
-        old_entry = self.session_store._entries.get(session_key)
+        # Snapshot was taken above, before reset_session() rotates the binding.
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
@@ -238,8 +294,21 @@ class GatewaySlashCommandsMixin:
         except Exception:
             pass
 
-        # Reset the session
-        new_entry = await self.async_session_store.reset_session(session_key)
+        # Reset the session using CAS so a concurrent session move cannot
+        # attach this handoff to (or reset) the wrong session.
+        if old_entry_is_real:
+            new_entry = await self.async_session_store.reset_session(
+                session_key,
+                expected_session_id=old_session_id,
+                metadata={"telegram_new_handoff": handoff_metadata}
+                if handoff_metadata is not None
+                else None,
+            )
+        else:
+            new_entry = await self.async_session_store.reset_session(session_key)
+        if new_entry is None and old_entry_is_real:
+            logger.warning("Session reset CAS failed for %s; refusing reset", session_key)
+            return EphemeralReply("⚠️ Session 已发生并发变化，未执行重置；请重试 /new。")
 
         # (Conversation-scoped overrides + security state were already
         # cleared via _clear_conversation_scope above.)

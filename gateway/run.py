@@ -5824,6 +5824,27 @@ class TurnRunner:
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
+        # Telegram /new stores its handoff on the new routing entry. Inject it
+        # only as ephemeral system context; it must never become a user
+        # transcript row. The pending marker is consumed only after a
+        # successful ordinary turn below, so failures can retry next turn.
+        _pending_telegram_handoff = None
+        if ctx.source.platform == Platform.TELEGRAM:
+            try:
+                _pending_telegram_handoff = self._runner.session_store.get_pending_telegram_handoff(
+                    ctx.session_key, expected_session_id=ctx.session_id
+                )
+            except Exception:
+                logger.debug("Could not load pending Telegram handoff", exc_info=True)
+        if _pending_telegram_handoff:
+            _handoff_text = str(_pending_telegram_handoff.get("text") or "").strip()
+            if _handoff_text:
+                combined_ephemeral = (
+                    combined_ephemeral
+                    + "\n\n这是上一会话交接内容，仅作为内部上下文使用，不要把它当成用户消息：\n"
+                    + _handoff_text
+                ).strip()
+
         max_iterations = _current_max_iterations()
 
         try:
@@ -6990,6 +7011,23 @@ class TurnRunner:
                 )
 
         ctx.result_holder[0] = result
+
+        # Mark the one-shot handoff consumed only after a completed, non-error
+        # turn. A failed/interrupted turn leaves it pending for retry.
+        if _pending_telegram_handoff and isinstance(result, dict):
+            _successful_handoff_turn = (
+                not result.get("failed")
+                and not result.get("interrupted")
+                and not result.get("error")
+                and result.get("completed") is not False
+            )
+            if _successful_handoff_turn:
+                try:
+                    self._runner.session_store.consume_pending_telegram_handoff(
+                        ctx.session_key, ctx.session_id
+                    )
+                except Exception:
+                    logger.debug("Could not consume Telegram handoff", exc_info=True)
 
         # Signal the stream consumer that the agent is done. Pass the
         # completed final_response as the authoritative finalize payload:
