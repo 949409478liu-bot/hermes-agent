@@ -17,6 +17,25 @@ from agent.turn_preflight import PreflightGateVerdict, run_preflight_compression
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def context_hard_cap_verdict(agent: Any, request_pressure_tokens: Any) -> str | None:
+    """Return the configured hard-cap action when this request must not be sent.
+
+    This is deliberately separate from compression: the hard cap protects the relay
+    billing tier even when compression is enabled, deferred, or ineffective.
+    """
+    if not getattr(agent, "context_hard_cap_enabled", False):
+        return None
+    limit = getattr(agent, "context_hard_cap_tokens", 0)
+    if not isinstance(request_pressure_tokens, int) or isinstance(request_pressure_tokens, bool):
+        return None
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return None
+    if request_pressure_tokens < limit:
+        return None
+    action = str(getattr(agent, "context_hard_cap_action", "new_session") or "new_session").lower()
+    return action if action in {"new_session", "reset"} else "new_session"
+
+
 def run_preflight_gate(
     agent: Any, *, request_pressure_tokens: Any, _moa_prepared_request: Any,
     pending_moa_prepared_request: Any, messages: Any, system_message: Any, user_message: Any,
@@ -30,6 +49,7 @@ def run_preflight_gate(
     consumed here (set to None) and re-armed only by a compression pass, so a blocked
     preflight never compares against a stale figure."""
     from agent.conversation_loop import _ollama_context_limit_error
+    from agent.conversation_loop import _partial_turn_result
 
     v = PreflightGateVerdict(
         action="fallthrough", pending_moa_prepared_request=pending_moa_prepared_request,
@@ -55,6 +75,29 @@ def run_preflight_gate(
         with suppress(Exception):
             agent.iteration_budget.refund()
         v.action = "break"
+        return v
+
+    _hard_cap_action = context_hard_cap_verdict(agent, request_pressure_tokens)
+    if _hard_cap_action:
+        # Do not compress and continue: the user explicitly wants a billing-tier
+        # guard. Cross-surface session-id rotation is not safe from this low-level
+        # loop, so fail closed with an actionable reset notice.
+        _limit = int(agent.context_hard_cap_tokens)
+        _message = (
+            f"Context hard cap reached (~{request_pressure_tokens:,} tokens; limit {_limit:,}). "
+            "The provider request was not sent. Start a new session with /new (or /reset) "
+            "and retry."
+        )
+        agent._persist_session(messages, conversation_history)
+        v.final_response = _message
+        v.failed = True
+        v._turn_exit_reason = f"context_hard_cap_{_hard_cap_action}"
+        append_message(messages, {"role": "assistant", "content": _message})
+        v.action = "return"
+        v.result = _partial_turn_result(
+            _message, messages, v.api_call_count, failed=True,
+            turn_exit_reason=v._turn_exit_reason,
+        )
         return v
 
     # Pre-API pressure check: tool results grow a turn and last_prompt_tokens lags

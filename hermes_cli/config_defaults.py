@@ -552,6 +552,12 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        # Absolute safety stop before any provider request reaches a relay billing tier.
+        # Defaults are intentionally below the 240K tier; action is surfaced as a new-session
+        # request because the low-level agent loop cannot safely rotate every client surface.
+        "hard_cap_tokens": 220000,
+        "hard_cap_enabled": True,
+        "hard_cap_action": "new_session",
         # checkpoint_required: fail closed before lossy compaction unless an active memory provider
         # confirms checkpoint API compatibility and completes the checkpoint.
         "checkpoint_required": False,
