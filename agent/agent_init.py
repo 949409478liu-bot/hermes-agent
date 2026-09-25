@@ -1519,6 +1519,11 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     threshold_tokens = cfg.get("threshold_tokens", cfg_get(DEFAULT_CONFIG, "compression", "threshold_tokens"))
     if threshold_tokens is not None:
         threshold_tokens = _positive_int(threshold_tokens)
+    hard_cap_tokens = _positive_int(cfg.get("hard_cap_tokens", 220000))
+    hard_cap_enabled = _cfg_flag(cfg, "hard_cap_enabled", True) and hard_cap_tokens is not None
+    hard_cap_action = str(cfg.get("hard_cap_action", "new_session") or "new_session").strip().lower()
+    if hard_cap_action not in {"new_session", "reset"}:
+        hard_cap_action = "new_session"
     # Non-system head messages to protect (system prompt is always protected); 0 is a
     # legitimate "system prompt + summary + tail".
     protect_first = max(0, int(cfg.get("protect_first_n", 3)))
@@ -1559,6 +1564,9 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         },
         threshold_tokens=threshold_tokens,
+        hard_cap_tokens=hard_cap_tokens or 220000,
+        hard_cap_enabled=hard_cap_enabled,
+        hard_cap_action=hard_cap_action,
         checkpoint_required=checkpoint_required,
         # In-place compaction: no session-id rotation. default=True MUST match DEFAULT_CONFIG
         # (a False default flipped agents into rotation mode when the key was omitted).
@@ -1995,6 +2003,9 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         with suppress(Exception):
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
     agent.compression_enabled = cs.enabled
+    agent.context_hard_cap_enabled = cs.hard_cap_enabled
+    agent.context_hard_cap_tokens = cs.hard_cap_tokens
+    agent.context_hard_cap_action = cs.hard_cap_action
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
     # Micro-compaction has no pre-compress checkpoint hook; suppress it while the gate is
