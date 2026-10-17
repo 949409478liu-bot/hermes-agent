@@ -19,7 +19,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -396,7 +396,10 @@ function emitPairEvent(event) {
 }
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
-const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
+// fetchLatestBaileysVersion() reads a version pinned in the Baileys repository,
+// which can lag behind the version currently accepted by WhatsApp. Pairing is
+// especially sensitive to this, so resolve the live WhatsApp Web version.
+const getWAVersion = createVersionResolver(fetchLatestWaWebVersion);
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -855,6 +858,10 @@ app.post('/send', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  } finally {
+    // A composing presence can otherwise remain visible until WhatsApp's
+    // server-side expiry, making a completed or failed turn look stuck.
+    try { await sock.sendPresenceUpdate('paused', chatId); } catch (_) {}
   }
 });
 
