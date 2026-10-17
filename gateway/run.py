@@ -5900,8 +5900,13 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # Explicit MOCK turns must reach the final SendResult receipt path;
+        # streaming/interim output cannot provide that receipt or pause guard.
+        from tools.mock_qa_tool import eligible as _mock_qa_eligible
+        if _mock_qa_eligible(ctx.source, ctx.message):
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_interim_messages = ctx.interim_assistant_messages_enabled and not _mock_qa_eligible(ctx.source, ctx.message)
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -6984,7 +6989,21 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            # Reply anchors may be None in Telegram topics; provenance is the
+            # actual inbound source ID populated by TelegramAdapter._build_event.
+            _inbound_id = (
+                getattr(ctx.source, "message_id", None)
+                if ctx.source.platform == Platform.TELEGRAM
+                else ctx.event_message_id
+            )
+            if _inbound_id:
+                _conversation_kwargs["persist_user_message_id"] = str(_inbound_id)
+            from tools.mock_qa_tool import turn as _mock_qa_turn
+            with _mock_qa_turn(ctx.source, ctx.session_key, ctx.message) as _mock_guide:
+                if _mock_guide and isinstance(_api_run_message, str):
+                    _api_run_message += _mock_guide
+                    _conversation_kwargs.setdefault("persist_user_message", ctx.message)
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -20006,6 +20025,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     content_inlined=inline_flag is not False,
                 )
                 message_text = f"{context_note}\n\n{message_text}"
+
+        # Telegram provenance is per-turn metadata, never a cached system ID.
+        if source is not None and source.platform == Platform.TELEGRAM and event.message_id:
+            message_text = (
+                f"[Telegram inbound message id: `{event.message_id}`]\n\n"
+                f"{message_text}"
+            )
 
         # Discord: surface the triggering message id per-turn on the user
         # message rather than in the cached system prompt. message_id changes

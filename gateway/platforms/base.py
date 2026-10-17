@@ -6572,6 +6572,13 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                # Only the explicitly staged, out-of-vault MOCK may bind a receipt.
+                from gateway.mock_qa_delivery import prepare as _qa_prepare, should_block as _qa_block
+                if _qa_block(event, session_key, str(response)):
+                    logger.info("Suppressed paused MOCK follow-up")
+                    return
+                _qa_ticket = _qa_prepare(event, session_key, str(response))
+
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used
@@ -6819,6 +6826,12 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if _qa_ticket is not None:
+                        try:
+                            from gateway.mock_qa_delivery import complete as _qa_complete
+                            await asyncio.to_thread(_qa_complete, _qa_ticket, result)
+                        except Exception:
+                            logger.warning("MOCK follow-up receipt write failed", exc_info=True)
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
